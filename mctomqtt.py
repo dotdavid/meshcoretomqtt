@@ -9,6 +9,7 @@ import time
 import calendar
 import logging
 import signal
+import threading
 from datetime import datetime
 from time import sleep
 from auth_token import create_auth_token, read_private_key_file
@@ -86,14 +87,15 @@ class MeshCoreBridgeManager:
     def __init__(self, debug=False):
         self.debug = debug
         self.config_port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
-        self.bridges = []
+        self.bridges = []        
+        self.bridge_threads = []
         self.should_exit = False
 
         # Set up signal handlers
         signal.signal(signal.SIGTERM, self.handle_shutdown)
         signal.signal(signal.SIGINT, self.handle_shutdown)
 
-        logger.info("Initialised MeshCoreBridgeManager")
+        logger.info("Initialised Bridge Manager")
 
     def handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully"""
@@ -107,18 +109,38 @@ class MeshCoreBridgeManager:
                 pass
 
     def run(self):
-            
+        
+        logger.info(f"Creating {self.config_port_count} bridge(s) for configured serial ports")
+
         for config_port_number in range(self.config_port_count):
             bridge = MeshCoreBridge(config_port_number=config_port_number, debug=args.debug)
-            bridge.run()
             self.bridges.append(bridge)
 
-        logger.info(f"Executing with {len(self.bridges)} bridges")
+            # Create and start a thread for each bridge
+            bridge_thread = threading.Thread(
+                target=bridge.run,
+                name=f"Bridge-{config_port_number}"
+            )
+            bridge_thread.daemon = True  # Allow thread to be terminated when main program exits
+            bridge_thread.start()
+            self.bridge_threads.append(bridge_thread)
+
+        logger.info(f"{len(self.bridge_threads)} bridge(s) configured and executing")
 
         try:
             while True:
                 if self.should_exit:
-                    return # clean exit
+                    logger.info("Shutting down bridges...")
+                    # Wait for all threads to finish (with timeout)
+                    for thread in self.bridge_threads:
+                        thread.join(timeout=5.0)
+                    return
+                
+                 # Check if any threads have died unexpectedly
+                for i, thread in enumerate(self.bridge_threads):
+                    if not thread.is_alive():
+                        logger.error(f"Bridge thread {i} died unexpectedly")
+                
                 sleep(1)
                 
         except KeyboardInterrupt:
