@@ -86,41 +86,74 @@ class MeshCoreBridgeManager:
 
     def __init__(self, debug=False):
         self.debug = debug
-        self.port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
-        self.bridges = []
+        self.config_port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
+        self.bridges = []        
+        self.bridge_threads = []
         self.should_exit = False
 
-        logger.info("Initialised MeshCoreBridgeManager")
+        # Set up signal handlers
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
+        signal.signal(signal.SIGINT, self.handle_shutdown)
+
+        logger.info("Initialised Bridge Manager")
+
+    def handle_shutdown(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.should_exit = True
+        # Signal all bridges to stop
+        for bridge in self.bridges:
+            try:
+                bridge.should_exit = True
+            except:
+                pass
 
     def run(self):
-            
-            for port_num in range(self.port_count):
-                bridge = MeshCoreBridge(debug=args.debug)
-                bridge.run()
-                self.bridges.append(bridge)
+        
+        logger.info(f"Creating {self.config_port_count} bridge(s) for configured serial ports")
 
-            logger.info(f"Executing with {len(self.bridges)} bridges")
+        for config_port_number in range(self.config_port_count):
+            bridge = MeshCoreBridge(config_port_number=config_port_number, debug=args.debug)
+            self.bridges.append(bridge)
 
-            try:
-                while True:
-                    if self.should_exit:
-                        sys.exit(-1)
-                    sleep(0.5)
-                    
-            except KeyboardInterrupt:
-                logger.info("\nExiting...")
-                for bridge in self.bridges:
-                    try:
-                        bridge.should_exit = True
-                    except:
-                        pass
+            # Create and start a thread for each bridge
+            bridge_thread = threading.Thread(
+                target=bridge.run,
+                name=f"Bridge-{config_port_number}"
+            )
+            bridge_thread.daemon = True  # Allow thread to be terminated when main program exits
+            bridge_thread.start()
+            self.bridge_threads.append(bridge_thread)
+
+        logger.info(f"{len(self.bridge_threads)} bridge(s) configured and executing")
+
+        try:
+            while True:
+                if self.should_exit:
+                    logger.info("Shutting down bridges...")
+                    # Wait for all threads to finish (with timeout)
+                    for thread in self.bridge_threads:
+                        thread.join(timeout=5.0)
+                    return
+                
+                 # Check if any threads have died unexpectedly
+                for i, thread in enumerate(self.bridge_threads):
+                    if not thread.is_alive():
+                        logger.error(f"Bridge thread {i} died unexpectedly")
+                
+                sleep(1)
+                
+        except KeyboardInterrupt:
+            logger.info("\nInterrupt received, shutting down bridges...")
+            # The SIGINT handler will handle shutdown
+            pass
 
 class MeshCoreBridge:
     last_raw: bytes = None
 
     def __init__(self, debug=False, config_port_number=0):
         self.debug = debug
-        self.port_number = 0
+        self.config_port_number = config_port_number
         self.repeater_name = None
         self.repeater_pub_key = None
         self.repeater_priv_key = None
@@ -250,20 +283,18 @@ class MeshCoreBridge:
             password = self.get_env(f"MQTT{broker_num}_PASSWORD", "")
             return username, password
 
-    def connect_serial(self, portNumber):
+    def connect_serial(self):
         ports = self.get_env("SERIAL_PORTS", "/dev/ttyACM0").split(",")
         baud_rate = self.get_env_int("SERIAL_BAUD_RATE", 115200)
         timeout = self.get_env_int("SERIAL_TIMEOUT", 2)
 
-        if portNumber is not None:
-            if portNumber < 0 or portNumber >= len(ports):
-                logger.error(f"Invalid port number {portNumber}, available ports are 0 to {len(ports)-1}")
+        if self.config_port_number is not None:
+            if self.config_port_number < 0 or self.config_port_number >= len(ports):
+                logger.error(f"Invalid port number {self.config_port_number}, available ports are 0 to {len(ports)-1}")
                 return False
 
-            port = ports[portNumber]
-        else:
-            logger.debug("Using default serial port 0")
-            port = ports[0]
+            port = ports[self.config_port_number]
+            logger.debug(f"Using configured serial port {self.config_port_number}: {port}")
             
         try:
             self.ser = serial.Serial(
@@ -438,8 +469,6 @@ class MeshCoreBridge:
         if "-> " in response:
             board_type = response.split("-> ", 1)[1]
             board_type = board_type.split('\n')[0].replace('\r', '').strip()
-            if board_type == "Unknown command":
-                board_type = "unknown"
             logger.info(f"Board type: {board_type}")
             return board_type
         
@@ -476,13 +505,11 @@ class MeshCoreBridge:
                 logger.error(f"MQTT connection failed for {broker_name}: Not authorized - token will be regenerated on next reconnect")
                 # Clear the cached token to force regeneration on next attempt
                 if broker_num in self.token_cache:
-                    logger.info(f"MQTT{broker_num}: Clearing cached token due to auth failure")
                     del self.token_cache[broker_num]
                 # Mark the client info for recreation
                 for mqtt_info in self.mqtt_clients:
                     if mqtt_info['broker_num'] == broker_num:
                         mqtt_info['needs_recreate'] = True
-                        logger.info(f"MQTT{broker_num}: Marked for recreation with fresh token")
                         break
             else:
                 logger.error(f"MQTT connection failed for {broker_name} with code {rc}")
@@ -698,41 +725,35 @@ class MeshCoreBridge:
             
             broker_num = mqtt_info['broker_num']
             
-            # Check if using auth tokens and if token is expired or close to expiring
-            use_auth_token = self.get_env_bool(f"MQTT{broker_num}_USE_AUTH_TOKEN", False)
-            if use_auth_token and broker_num in self.token_cache:
-                cached_token, created_at = self.token_cache[broker_num]
-                token_age = current_time - created_at
-                if token_age > (self.token_ttl - 300):
-                    logger.warning(f"MQTT{broker_num}: Token expired or near expiry (age: {token_age:.0f}s), recreating client")
-                    
+            # Check if client needs to be recreated (auth failure means we need fresh token)
+            if mqtt_info.get('needs_recreate', False):
+                logger.warning(f"MQTT{broker_num}: Recreating client with fresh token after auth failure")
+                
+                try:
+                    # Stop the old client
+                    old_client = mqtt_info['client']
                     try:
-                        # Stop the old client
-                        old_client = mqtt_info['client']
-                        try:
-                            old_client.loop_stop()
-                            old_client.disconnect()
-                        except:
-                            pass
-                        
-                        # Clear cached token
-                        del self.token_cache[broker_num]
-                        
-                        # Create new client with fresh token
-                        new_client_info = self.connect_mqtt_broker(broker_num)
-                        if new_client_info:
-                            self.mqtt_clients[i] = new_client_info
-                            logger.info(f"MQTT{broker_num}: Successfully recreated client with fresh token")
-                        else:
-                            logger.error(f"MQTT{broker_num}: Failed to recreate client")
-                            mqtt_info['reconnect_at'] = current_time + self.reconnect_delay
-                            self.reconnect_delay = min(self.reconnect_delay * self.reconnect_backoff, self.max_reconnect_delay)
-                    except Exception as e:
-                        logger.error(f"MQTT{broker_num}: Error recreating client: {e}")
+                        old_client.loop_stop()
+                        old_client.disconnect()
+                    except:
+                        pass
+                    
+                    # Create a new client with fresh credentials (token already cleared from cache)
+                    new_client_info = self.connect_mqtt_broker(broker_num)
+                    if new_client_info:
+                        self.mqtt_clients[i] = new_client_info
+                        logger.info(f"MQTT{broker_num}: Successfully recreated client with fresh token")
+                    else:
+                        logger.error(f"MQTT{broker_num}: Failed to recreate client")
                         mqtt_info['reconnect_at'] = current_time + self.reconnect_delay
                         self.reconnect_delay = min(self.reconnect_delay * self.reconnect_backoff, self.max_reconnect_delay)
                     
-                    continue
+                except Exception as e:
+                    logger.error(f"MQTT{broker_num}: Error recreating client: {e}")
+                    mqtt_info['reconnect_at'] = current_time + self.reconnect_delay
+                    self.reconnect_delay = min(self.reconnect_delay * self.reconnect_backoff, self.max_reconnect_delay)
+                
+                continue
             
             # Normal reconnect attempt
             try:
@@ -833,8 +854,7 @@ class MeshCoreBridge:
                 pass
 
     def run(self):
-        if not self.connect_serial(self.config_port_number):
-        main
+        if not self.connect_serial():
             return
 
         self.set_repeater_time()
@@ -898,7 +918,7 @@ class MeshCoreBridge:
                         self.parse_and_publish(line)
                 except OSError:
                    logger.warning("Serial connection unavailable, trying to reconnect")
-                   self.connect_serial(self.port_number)
+                   self.connect_serial(self.config_port_number)
                    sleep(0.5)
                 sleep(0.01)
                 
