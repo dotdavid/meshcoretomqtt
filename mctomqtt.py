@@ -86,6 +86,7 @@ class MeshCoreBridgeManager:
 
     def __init__(self, debug=False):
         self.debug = debug
+        self.client_version = self._load_client_version()
         self.config_port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
         self.bridges = []        
         self.bridge_threads = []
@@ -95,7 +96,7 @@ class MeshCoreBridgeManager:
         signal.signal(signal.SIGTERM, self.handle_shutdown)
         signal.signal(signal.SIGINT, self.handle_shutdown)
 
-        logger.info("Initialised Bridge Manager")
+        logger.info(f"meshcoretomqtt version {self.client_version}")
 
     def handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully"""
@@ -108,12 +109,27 @@ class MeshCoreBridgeManager:
             except:
                 pass
 
+    def _load_client_version(self):
+        """Load client version from .version_info file"""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            version_file = os.path.join(script_dir, '.version_info')
+            if os.path.exists(version_file):
+                with open(version_file, 'r') as f:
+                    version_data = json.load(f)
+                    installer_ver = version_data.get('installer_version', 'unknown')
+                    git_hash = version_data.get('git_hash', 'unknown')
+                    return f"meshcoretomqtt/{installer_ver}-{git_hash}"
+        except Exception as e:
+            logger.debug(f"Could not load version info: {e}")
+        return "meshcoretomqtt/unknown"
+
     def run(self):
         
         logger.info(f"Creating {self.config_port_count} bridge(s) for configured serial ports")
 
         for config_port_number in range(self.config_port_count):
-            bridge = MeshCoreBridge(config_port_number=config_port_number, debug=args.debug)
+            bridge = MeshCoreBridge(config_port_number=config_port_number, debug=args.debug, client_version=self.client_version)
             self.bridges.append(bridge)
 
             # Create and start a thread for each bridge
@@ -151,7 +167,7 @@ class MeshCoreBridgeManager:
 class MeshCoreBridge:
     last_raw: bytes = None
 
-    def __init__(self, debug=False, config_port_number=0):
+    def __init__(self, debug=False, config_port_number=0, client_version=None):
         self.debug = debug
         self.config_port_number = config_port_number
         self.repeater_name = None
@@ -160,7 +176,7 @@ class MeshCoreBridge:
         self.radio_info = None
         self.firmware_version = None
         self.model = None
-        self.client_version = self._load_client_version()
+        self.client_version = client_version
         self.ser = None
         self.mqtt_clients = []
         self.mqtt_connected = False
@@ -173,21 +189,6 @@ class MeshCoreBridge:
         self.token_ttl = 3600  # 1 hour token TTL
         
         logger.info("Configuration loaded from environment variables")
-    
-    def _load_client_version(self):
-        """Load client version from .version_info file"""
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            version_file = os.path.join(script_dir, '.version_info')
-            if os.path.exists(version_file):
-                with open(version_file, 'r') as f:
-                    version_data = json.load(f)
-                    installer_ver = version_data.get('installer_version', 'unknown')
-                    git_hash = version_data.get('git_hash', 'unknown')
-                    return f"meshcoretomqtt/{installer_ver}-{git_hash}"
-        except Exception as e:
-            logger.debug(f"Could not load version info: {e}")
-        return "meshcoretomqtt/unknown"
     
     def get_env(self, key, fallback=''):
         """Get environment variable with fallback (all vars are MCTOMQTT_ prefixed)"""
