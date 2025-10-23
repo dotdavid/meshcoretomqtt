@@ -8,6 +8,7 @@ import re
 import time
 import calendar
 import logging
+import signal
 from datetime import datetime
 from time import sleep
 from auth_token import create_auth_token, read_private_key_file
@@ -84,41 +85,53 @@ class MeshCoreBridgeManager:
 
     def __init__(self, debug=False):
         self.debug = debug
-        self.port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
+        self.config_port_count = len(os.getenv(f"MCTOMQTT_SERIAL_PORTS", "/dev/ttyACM0").split(","))
         self.bridges = []
         self.should_exit = False
 
+        # Set up signal handlers
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
+        signal.signal(signal.SIGINT, self.handle_shutdown)
+
         logger.info("Initialised MeshCoreBridgeManager")
+
+    def handle_shutdown(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.should_exit = True
+        # Signal all bridges to stop
+        for bridge in self.bridges:
+            try:
+                bridge.should_exit = True
+            except:
+                pass
 
     def run(self):
             
-            for port_num in range(self.port_count):
-                bridge = MeshCoreBridge(debug=args.debug)
-                bridge.run()
-                self.bridges.append(bridge)
+        for config_port_number in range(self.config_port_count):
+            bridge = MeshCoreBridge(config_port_number=config_port_number, debug=args.debug)
+            bridge.run()
+            self.bridges.append(bridge)
 
-            logger.info(f"Executing with {len(self.bridges)} bridges")
+        logger.info(f"Executing with {len(self.bridges)} bridges")
 
-            try:
-                while True:
-                    if self.should_exit:
-                        sys.exit(-1)
-                    sleep(0.5)
-                    
-            except KeyboardInterrupt:
-                logger.info("\nExiting...")
-                for bridge in self.bridges:
-                    try:
-                        bridge.should_exit = True
-                    except:
-                        pass
+        try:
+            while True:
+                if self.should_exit:
+                    return # clean exit
+                sleep(1)
+                
+        except KeyboardInterrupt:
+            logger.info("\nInterrupt received, shutting down bridges...")
+            # The SIGINT handler will handle shutdown
+            pass
 
 class MeshCoreBridge:
     last_raw: bytes = None
 
-    def __init__(self, debug=False):
+    def __init__(self, debug=False, config_port_number=0):
         self.debug = debug
-        self.port_number = 0
+        self.config_port_number = config_port_number
         self.repeater_name = None
         self.repeater_pub_key = None
         self.repeater_priv_key = None
@@ -801,8 +814,27 @@ class MeshCoreBridge:
                 self.safe_publish(packets_topic, json.dumps(message))
             return
 
+    def cleanup(self):
+        """Clean up resources before exit"""
+        logger.info("Cleaning up resources...")
+        # Publish offline status to all brokers
+        for mqtt_client_info in self.mqtt_clients:
+            try:
+                self.publish_status("offline", client=mqtt_client_info['client'], 
+                                  broker_num=mqtt_client_info['broker_num'])
+                mqtt_client_info['client'].disconnect()
+                mqtt_client_info['client'].loop_stop()
+            except:
+                pass
+        
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except:
+                pass
+
     def run(self):
-        if not self.connect_serial(self.port_number):
+        if not self.connect_serial(self.config_port_number):
             return
 
         self.set_repeater_time()
@@ -866,18 +898,14 @@ class MeshCoreBridge:
                         self.parse_and_publish(line)
                 except OSError:
                    logger.warning("Serial connection unavailable, trying to reconnect")
-                   self.connect_serial(self.port_number)
+                   self.connect_serial(self.config_port_number)
                    sleep(0.5)
                 sleep(0.01)
                 
         except KeyboardInterrupt:
-            logger.info("\nExiting...")
-            for mqtt_client_info in self.mqtt_clients:
-                try:
-                    mqtt_client_info['client'].disconnect()
-                except:
-                    pass
-            self.ser.close()
+            logger.info("\nReceived keyboard interrupt...")
+        finally:
+            self.cleanup()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
