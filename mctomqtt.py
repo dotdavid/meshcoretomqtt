@@ -85,7 +85,7 @@ class MeshCoreBridge:
     last_raw: bytes = None
 
     def __init__(self, debug=False):
-        self.debug = debug
+        self.debug = self.get_env_bool(f"DEBUG", debug)
         self.repeater_name = None
         self.repeater_pub_key = None
         self.repeater_priv_key = None
